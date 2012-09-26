@@ -1,0 +1,7 @@
+*.o
+objs
+.gitignore
+*.mine
+*.orig
+.svn
+*.swp

@@ -1,0 +1,71 @@
+--- src/event/ngx_event_openssl.c
++++ src/event/ngx_event_openssl.c
+@@ -30,7 +34,7 @@
+     ngx_err_t err, char *text);
+ static void ngx_ssl_clear_error(ngx_log_t *log);
+ 
+-static ngx_int_t ngx_ssl_session_cache_init(ngx_shm_zone_t *shm_zone,
++static ngx_int_t ngx_ssl_shm_session_cache_init(ngx_shm_zone_t *shm_zone,
+     void *data);
+ static int ngx_ssl_new_session(ngx_ssl_conn_t *ssl_conn,
+     ngx_ssl_session_t *sess);
+@@ -1484,14 +1492,26 @@
+ 
+     SSL_CTX_set_timeout(ssl->ctx, (long) timeout);
+ 
+-    if (shm_zone) {
+-        shm_zone->init = ngx_ssl_session_cache_init;
++    if (sc_cfg->shm_zone) {
++        sc_cfg->shm_zone->init = ngx_ssl_shm_session_cache_init;
++    }
++    
++    if (sc_cfg->shm_zone || sc_cfg->memcache_name.len > 0) {
++
++        ngx_log_error_core(NGX_LOG_NOTICE, ssl->log, 0,
++                      "Using an external SSL session cache");
+ 
+         SSL_CTX_sess_set_new_cb(ssl->ctx, ngx_ssl_new_session);
+         SSL_CTX_sess_set_get_cb(ssl->ctx, ngx_ssl_get_cached_session);
+         SSL_CTX_sess_set_remove_cb(ssl->ctx, ngx_ssl_remove_session);
+ 
+-        if (SSL_CTX_set_ex_data(ssl->ctx, ngx_ssl_session_cache_index, shm_zone)
++        /* TLS Session Tickets use a random encryption key which is different
++         * per server. Clients will attempt to use this instead of server-side
++         * sessions, defeating the purpose of caching sessions in the first place.
++         */
++        SSL_CTX_set_options(ssl->ctx, SSL_OP_NO_TICKET);
++
++        if (SSL_CTX_set_ex_data(ssl->ctx, ngx_ssl_session_cache_index, sc_cfg)
+             == 0)
+         {
+             ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0,
+@@ -1505,7 +1525,7 @@
+ 
+ 
+ static ngx_int_t
+-ngx_ssl_session_cache_init(ngx_shm_zone_t *shm_zone, void *data)
++ngx_ssl_shm_session_cache_init(ngx_shm_zone_t *shm_zone, void *data)
+ {
+     size_t                    len;
+     ngx_slab_pool_t          *shpool;
+@@ -1751,8 +1828,9 @@
+     u_char                   *p;
+     uint32_t                  hash;
+     ngx_int_t                 rc;
++    ngx_ssl_session_cache_cfg_t  *sc_cfg;
+     ngx_shm_zone_t           *shm_zone;
+-    ngx_slab_pool_t          *shpool;
++    ngx_slab_pool_t              *shpool = NULL;
+     ngx_connection_t         *c;
+     ngx_rbtree_node_t        *node, *sentinel;
+     ngx_ssl_session_t        *sess;
+@@ -1760,7 +1838,9 @@
+     ngx_ssl_session_cache_t  *cache;
+     u_char                    buf[NGX_SSL_MAX_SESSION_SIZE];
+ 
++
+     c = ngx_ssl_get_connection(ssl_conn);
++    sess = NULL;
+ 
+     hash = ngx_crc32_short(id, (size_t) len);
+     *copy = 0;
