@@ -79,6 +79,7 @@ ngx_pstrdup(ngx_pool_t *pool, ngx_str_t *src)
  *    %[0][width][u][x|X]L      int64_t/uint64_t
  *    %[0][width|m][u][x|X]A    ngx_atomic_int_t/ngx_atomic_uint_t
  *    %[0][width][.width]f      double, max valid number fits to %18.15f
+ *    %[x|X]*s                  length and string
  *    %P                        ngx_pid_t
  *    %M                        ngx_msec_t
  *    %r                        rlim_t
@@ -86,7 +87,6 @@ ngx_pstrdup(ngx_pool_t *pool, ngx_str_t *src)
  *    %V                        ngx_str_t *
  *    %v                        ngx_variable_value_t *
  *    %s                        null-terminated string
- *    %*s                       length and string
  *    %Z                        '\0'
  *    %N                        '\n'
  *    %c                        char
@@ -141,10 +141,13 @@ ngx_slprintf(u_char *buf, u_char *last, const char *fmt, ...)
 }
 
 
+static u_char   ngx_hex[] = "0123456789abcdef";
+static u_char   ngx_HEX[] = "0123456789ABCDEF";
+
 u_char *
 ngx_vslprintf(u_char *buf, u_char *last, const char *fmt, va_list args)
 {
-    u_char                *p, zero;
+    u_char                *p, zero, *hex_p;
     int                    d;
     double                 f;
     size_t                 len, slen;
@@ -250,14 +253,35 @@ ngx_vslprintf(u_char *buf, u_char *last, const char *fmt, va_list args)
             case 's':
                 p = va_arg(args, u_char *);
 
-                if (slen == (size_t) -1) {
-                    while (*p && buf < last) {
-                        *buf++ = *p++;
+                if (hex == 0) {
+                    if (slen == (size_t) -1) {
+                        while (*p && buf < last) {
+                            *buf++ = *p++;
+                        }
+                    } else {
+                        len = ngx_min(((size_t) (last - buf)), slen);
+                        buf = ngx_cpymem(buf, p, len);
                     }
-
                 } else {
-                    len = ngx_min(((size_t) (last - buf)), slen);
-                    buf = ngx_cpymem(buf, p, len);
+                    if ( hex == 1 ) {
+                        hex_p = ngx_hex;
+                    } else {
+                        hex_p = ngx_HEX;
+                    }
+                    while (buf < (last-1)) {
+                        if ( slen == (size_t) -1) {
+                            if (!*p) break;
+                        } else {
+                            if ( slen == 0 ) {
+                                break;
+                            } else {
+                                --slen;
+                            }
+                        }
+                        *buf++ = hex_p[ ((uint32_t) *p & 0xf0) >> 4];
+                        *buf++ = hex_p[ ((uint32_t) *p) & 0xf];
+                        ++p;
+                    }
                 }
 
                 fmt++;
@@ -479,8 +503,6 @@ ngx_sprintf_num(u_char *buf, u_char *last, uint64_t ui64, u_char zero,
                         */
     size_t          len;
     uint32_t        ui32;
-    static u_char   hex[] = "0123456789abcdef";
-    static u_char   HEX[] = "0123456789ABCDEF";
 
     p = temp + NGX_INT64_LEN;
 
@@ -520,7 +542,7 @@ ngx_sprintf_num(u_char *buf, u_char *last, uint64_t ui64, u_char zero,
         do {
 
             /* the "(uint32_t)" cast disables the BCC's warning */
-            *--p = hex[(uint32_t) (ui64 & 0xf)];
+            *--p = ngx_hex[(uint32_t) (ui64 & 0xf)];
 
         } while (ui64 >>= 4);
 
@@ -529,7 +551,7 @@ ngx_sprintf_num(u_char *buf, u_char *last, uint64_t ui64, u_char zero,
         do {
 
             /* the "(uint32_t)" cast disables the BCC's warning */
-            *--p = HEX[(uint32_t) (ui64 & 0xf)];
+            *--p = ngx_HEX[(uint32_t) (ui64 & 0xf)];
 
         } while (ui64 >>= 4);
     }
