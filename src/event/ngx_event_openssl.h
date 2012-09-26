@@ -117,8 +117,6 @@ ngx_int_t ngx_ssl_set_session(ngx_connection_t *c, ngx_ssl_session_t *session);
 #define ngx_ssl_free_session        SSL_SESSION_free
 #define ngx_ssl_get_connection(ssl_conn)                                      \
     SSL_get_ex_data(ssl_conn, ngx_ssl_connection_index)
-#define ngx_ssl_get_server_conf(ssl_ctx)                                      \
-    SSL_CTX_get_ex_data(ssl_ctx, ngx_ssl_server_conf_index)
 
 
 ngx_int_t ngx_ssl_get_protocol(ngx_connection_t *c, ngx_pool_t *pool,
@@ -155,7 +153,6 @@ void ngx_ssl_cleanup_ctx(void *data);
 
 
 extern int  ngx_ssl_connection_index;
-extern int  ngx_ssl_server_conf_index;
 extern int  ngx_ssl_session_cache_index;
 
 

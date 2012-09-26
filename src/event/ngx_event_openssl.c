@@ -80,7 +80,6 @@ ngx_module_t  ngx_openssl_module = {
 
 
 int  ngx_ssl_connection_index;
-int  ngx_ssl_server_conf_index;
 int  ngx_ssl_session_cache_index;
 
 
@@ -119,14 +118,6 @@ ngx_ssl_init(ngx_log_t *log)
         return NGX_ERROR;
     }
 
-    ngx_ssl_server_conf_index = SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL,
-                                                         NULL);
-    if (ngx_ssl_server_conf_index == -1) {
-        ngx_ssl_error(NGX_LOG_ALERT, log, 0,
-                      "SSL_CTX_get_ex_new_index() failed");
-        return NGX_ERROR;
-    }
-
     ngx_ssl_session_cache_index = SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL,
                                                            NULL);
     if (ngx_ssl_session_cache_index == -1) {
@@ -146,12 +137,6 @@ ngx_ssl_create(ngx_ssl_t *ssl, ngx_uint_t protocols, void *data)
 
     if (ssl->ctx == NULL) {
         ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0, "SSL_CTX_new() failed");
-        return NGX_ERROR;
-    }
-
-    if (SSL_CTX_set_ex_data(ssl->ctx, ngx_ssl_server_conf_index, data) == 0) {
-        ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0,
-                      "SSL_CTX_set_ex_data() failed");
         return NGX_ERROR;
     }
 
