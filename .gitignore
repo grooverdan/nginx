@@ -4,4 +4,4 @@ objs
 *.mine
 *.orig
 .svn
-*.swp
+*.sw*
