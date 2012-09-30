@@ -81,6 +81,35 @@ typedef struct {
 } ngx_ssl_session_cache_t;
 
 
+/* RFC 5077 */
+typedef struct {
+        u_char    hmac_key[16];
+        u_char    aes_key[16];
+        time_t    expire;
+} ngx_ssl_ticket_keys_t;
+
+
+typedef struct {
+	u_char                    key_name[16];
+	ngx_ssl_ticket_keys_t     keys;
+} ngx_ssl_ticket_id_t;
+
+
+#define NGX_SSL_ACTIVE_TICKETS  2
+typedef struct {
+    volatile unsigned      keystore_i;
+    ngx_ssl_ticket_id_t    keystore[NGX_SSL_ACTIVE_TICKETS];
+#if (NGX_THREADS)
+    ngx_shmtx_t            *keyrefresh;
+#endif
+} ngx_ssl_ticket_cache_t;
+
+
+typedef struct {
+    ngx_ssl_session_cache_t session;
+    ngx_ssl_ticket_cache_t ticket;
+} ngx_ssl_cache_t;
+
 
 #define NGX_SSL_SSLv2    0x0002
 #define NGX_SSL_SSLv3    0x0004
@@ -106,8 +135,9 @@ RSA *ngx_ssl_rsa512_key_callback(SSL *ssl, int is_export, int key_length);
 ngx_int_t ngx_ssl_dhparam(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *file);
 ngx_int_t ngx_ssl_ecdh_curve(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *name);
 ngx_int_t ngx_ssl_session_cache(ngx_ssl_t *ssl, ngx_str_t *sess_ctx,
-    ssize_t builtin_session_cache, ngx_shm_zone_t *shm_zone, time_t timeout);
-ngx_int_t ngx_ssl_session_cache_init(ngx_shm_zone_t *shm_zone, void *data);
+    ssize_t builtin_session_cache, ngx_shm_zone_t *shm_zone,
+    time_t session_timeout, long *ticket_timeout);
+ngx_int_t ngx_ssl_cache_init(ngx_shm_zone_t *shm_zone, void *data);
 ngx_int_t ngx_ssl_create_connection(ngx_ssl_t *ssl, ngx_connection_t *c,
     ngx_uint_t flags);
 

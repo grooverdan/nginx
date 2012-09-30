@@ -27,7 +27,7 @@ static void ngx_ssl_connection_error(ngx_connection_t *c, int sslerr,
     ngx_err_t err, char *text);
 static void ngx_ssl_clear_error(ngx_log_t *log);
 
-ngx_int_t ngx_ssl_session_cache_init(ngx_shm_zone_t *shm_zone, void *data);
+ngx_int_t ngx_ssl_cache_init(ngx_shm_zone_t *shm_zone, void *data);
 static int ngx_ssl_new_session(ngx_ssl_conn_t *ssl_conn,
     ngx_ssl_session_t *sess);
 static ngx_ssl_session_t *ngx_ssl_get_cached_session(ngx_ssl_conn_t *ssl_conn,
@@ -37,6 +37,11 @@ static void ngx_ssl_expire_sessions(ngx_ssl_session_cache_t *cache,
     ngx_slab_pool_t *shpool, ngx_uint_t n);
 static void ngx_ssl_session_rbtree_insert_value(ngx_rbtree_node_t *temp,
     ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
+
+static int ngx_ssl_tlsext_ticket_key_cb(SSL *s, unsigned char *key_name,
+    unsigned char *iv, EVP_CIPHER_CTX *ctx, HMAC_CTX *hctx, int enc);
+static ngx_int_t ngx_ssl_ticket_cache_init(ngx_ssl_ticket_cache_t *cache, ngx_log_t *log);
+static ngx_int_t ngx_ssl_ticket_new(ngx_ssl_ticket_cache_t *cache, unsigned i, long expire);
 
 static void *ngx_openssl_create_conf(ngx_cycle_t *cycle);
 static char *ngx_openssl_engine(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
@@ -81,6 +86,7 @@ ngx_module_t  ngx_openssl_module = {
 
 int  ngx_ssl_connection_index;
 int  ngx_ssl_session_cache_index;
+int  ngx_ssl_ticket_timeout_index;
 
 
 ngx_int_t
@@ -114,7 +120,8 @@ ngx_ssl_init(ngx_log_t *log)
     ngx_ssl_connection_index = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
 
     if (ngx_ssl_connection_index == -1) {
-        ngx_ssl_error(NGX_LOG_ALERT, log, 0, "SSL_get_ex_new_index() failed");
+        ngx_ssl_error(NGX_LOG_ALERT, log, 0,
+                      "SSL_get_ex_new_index() for ssl_connection failed");
         return NGX_ERROR;
     }
 
@@ -122,10 +129,17 @@ ngx_ssl_init(ngx_log_t *log)
                                                            NULL);
     if (ngx_ssl_session_cache_index == -1) {
         ngx_ssl_error(NGX_LOG_ALERT, log, 0,
-                      "SSL_CTX_get_ex_new_index() failed");
+                      "SSL_CTX_get_ex_new_index() for session cache failed");
         return NGX_ERROR;
     }
 
+    ngx_ssl_ticket_timeout_index = SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL,
+                                                           NULL);
+    if (ngx_ssl_ticket_timeout_index == -1) {
+        ngx_ssl_error(NGX_LOG_ALERT, log, 0,
+                      "SSL_CTX_get_ex_new_index() for ticket_timeout failed");
+        return NGX_ERROR;
+    }
     return NGX_OK;
 }
 
@@ -1498,7 +1512,8 @@ ngx_ssl_error(ngx_uint_t level, ngx_log_t *log, ngx_err_t err, char *fmt, ...)
 
 ngx_int_t
 ngx_ssl_session_cache(ngx_ssl_t *ssl, ngx_str_t *sess_ctx,
-    ssize_t builtin_session_cache, ngx_shm_zone_t *shm_zone, time_t timeout)
+    ssize_t builtin_session_cache, ngx_shm_zone_t *shm_zone,
+    time_t session_timeout, time_t *ticket_timeout)
 {
     long  cache_mode;
 
@@ -1547,18 +1562,28 @@ ngx_ssl_session_cache(ngx_ssl_t *ssl, ngx_str_t *sess_ctx,
         }
     }
 
-    SSL_CTX_set_timeout(ssl->ctx, (long) timeout);
+    SSL_CTX_set_timeout(ssl->ctx, (long) session_timeout);
 
     if (shm_zone) {
         SSL_CTX_sess_set_new_cb(ssl->ctx, ngx_ssl_new_session);
         SSL_CTX_sess_set_get_cb(ssl->ctx, ngx_ssl_get_cached_session);
         SSL_CTX_sess_set_remove_cb(ssl->ctx, ngx_ssl_remove_session);
 
+        SSL_CTX_set_tlsext_ticket_key_cb(ssl->ctx, ngx_ssl_tlsext_ticket_key_cb);
+
+        if (SSL_CTX_set_ex_data(ssl->ctx, ngx_ssl_ticket_timeout_index,
+                                ticket_timeout) == 0)
+        {
+            ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0,
+                          "SSL_CTX_set_ex_data() for ticket timeout failed");
+            return NGX_ERROR;
+        }
+
         if (SSL_CTX_set_ex_data(ssl->ctx, ngx_ssl_session_cache_index, shm_zone)
             == 0)
         {
             ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0,
-                          "SSL_CTX_set_ex_data() failed");
+                          "SSL_CTX_set_ex_data() for session cache failed");
             return NGX_ERROR;
         }
     }
@@ -1568,11 +1593,11 @@ ngx_ssl_session_cache(ngx_ssl_t *ssl, ngx_str_t *sess_ctx,
 
 
 ngx_int_t
-ngx_ssl_session_cache_init(ngx_shm_zone_t *shm_zone, void *data)
+ngx_ssl_cache_init(ngx_shm_zone_t *shm_zone, void *data)
 {
     size_t                    len;
     ngx_slab_pool_t          *shpool;
-    ngx_ssl_session_cache_t  *cache;
+    ngx_ssl_cache_t          *cache;
 
     if (data) {
         shm_zone->data = data;
@@ -1586,7 +1611,7 @@ ngx_ssl_session_cache_init(ngx_shm_zone_t *shm_zone, void *data)
 
     shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
 
-    cache = ngx_slab_alloc(shpool, sizeof(ngx_ssl_session_cache_t));
+    cache = ngx_slab_alloc(shpool, sizeof(ngx_ssl_cache_t));
     if (cache == NULL) {
         return NGX_ERROR;
     }
@@ -1594,23 +1619,327 @@ ngx_ssl_session_cache_init(ngx_shm_zone_t *shm_zone, void *data)
     shpool->data = cache;
     shm_zone->data = cache;
 
-    ngx_rbtree_init(&cache->session_rbtree, &cache->sentinel,
+    ngx_rbtree_init(&cache->session.session_rbtree, &cache->session.sentinel,
                     ngx_ssl_session_rbtree_insert_value);
 
-    ngx_queue_init(&cache->expire_queue);
+    ngx_queue_init(&cache->session.expire_queue);
 
-    len = sizeof(" in SSL session shared cache \"\"") + shm_zone->shm.name.len;
+    len = sizeof(" in SSL shared cache \"\"") + shm_zone->shm.name.len;
 
     shpool->log_ctx = ngx_slab_alloc(shpool, len);
     if (shpool->log_ctx == NULL) {
         return NGX_ERROR;
     }
 
-    ngx_sprintf(shpool->log_ctx, " in SSL session shared cache \"%V\"%Z",
+    ngx_sprintf(shpool->log_ctx, " in SSL shared cache \"%V\"%Z",
                 &shm_zone->shm.name);
+
+    ngx_ssl_ticket_cache_init(&cache->ticket, shm_zone->shm.log);
 
     return NGX_OK;
 }
+
+/* ssl tickets are RFC5077 tickets where the server 
+ * doesn't maintain a session crypto state for each client
+ * Like session IDs it provides a mechanism for the client
+ * to short cut the cryptographic exchange. It does this by
+ * encrypting the crypto state information in the ticket
+ * and providing it to the client.
+ *
+ * The server size cyptographic parameters that encrypt the
+ * session expire for the same time as the session cache.
+ * They are however renewed in 1/2 that time so clients can
+ * progress to the new state without doing a full cryptographic
+ * exchange. See note below about poor client support.
+ */
+
+static ngx_int_t
+ngx_ssl_ticket_cache_init(ngx_ssl_ticket_cache_t *cache, ngx_log_t *log)
+{
+    int i;
+
+    for (i = 0; i< NGX_SSL_ACTIVE_TICKETS; i++) {
+        cache->keystore[i].keys.expire = (unsigned long) -1;
+    }
+    cache->keystore_i = 0;
+#if (NGX_THREADS)
+    cache->keyrefresh = ngx_mutex_init(log, 0);
+    if (cache->keyrefresh == NULL) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+            "key refresh mutex initialisation failure");
+        return NGX_ERROR;
+    }
+#endif
+    return NGX_OK;
+}
+
+
+#define NGX_RENEW_SSL_TICKET
+/* Suspect that some clients aren't handling renewals properly
+ * despite being in rfc5077 3.3 paragraph 2.
+ * Tested clients:
+ * nss 3.13.5
+ * gnutls 2.12.17
+ * openssl 1.0.0j 
+ *
+ * returns 0 if expired, 1 if early and valid, 2 if renew */
+static ngx_int_t ngx_ssl_ticket_valid(time_t now, time_t ref, long expire) {
+#ifdef NGX_RENEW_SSL_TICKET
+   long renew = expire / 2;
+#endif
+    if ( now <= ref ) {
+#ifdef NGX_RENEW_SSL_TICKET
+      if ( now < (ref - renew) ) {
+        return 1;
+      }  else {
+        return 2;
+      }
+#else
+      return 1;
+#endif
+    } else {
+      return 0;
+    }
+}
+
+static ngx_int_t
+ngx_ssl_ticket_new(ngx_ssl_ticket_cache_t *cache,unsigned i, long expire)
+{
+    ngx_ssl_ticket_id_t *keys = &cache->keystore[i];
+    if ((RAND_bytes(keys->keys.hmac_key, 16) <= 0)
+        || (RAND_bytes(keys->keys.aes_key, 16) <= 0)
+        || (RAND_pseudo_bytes(keys->key_name, 16) <= 0))
+        return NGX_ERROR;
+    keys->keys.expire = ngx_time() + expire;
+    return NGX_OK;
+}
+
+
+static int
+ngx_ssl_tlsext_ticket_key_create(ngx_ssl_ticket_cache_t *cache, ngx_log_t *log,
+    unsigned char *key_name, unsigned char *iv, EVP_CIPHER_CTX *ctx,
+    HMAC_CTX *hctx, long expiretime)
+{
+    time_t                   t;
+    unsigned                 newi;
+    ngx_ssl_ticket_id_t      *k;
+
+    t = ngx_time();
+
+    /* create new session */
+    if (RAND_bytes(iv, EVP_MAX_IV_LENGTH) <= 0) {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+            "RAND_bytes entropy empty on iv initialisation");
+        return -1;
+    }
+    ngx_log_debug5(NGX_LOG_DEBUG_EVENT, log, 0,
+            "New iv %*Xs time %T current key expire %T expire interval %l",
+            (size_t) EVP_MAX_IV_LENGTH, iv,
+            t, cache->keystore[cache->keystore_i].keys.expire,
+            expiretime);
+    switch ( ngx_ssl_ticket_valid(t, cache->keystore[cache->keystore_i].keys.expire,
+             expiretime)) {
+    case 1:
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                  "current ticket sufficient");
+        break;
+    case 2:
+        ngx_log_debug(NGX_LOG_DEBUG_EVENT, log, 0,
+              "session ticket key valid but in renew period - use new key");
+        /* time for a new key */
+#if (NGX_THREADS)
+        ngx_shmtx_lock(cache->keyrefresh);
+#endif
+        /* check the next entry is expired inside the mutex to avoid a race
+         * condition if another worker already updated this */
+        newi = ( cache->keystore_i + 1) % NGX_SSL_ACTIVE_TICKETS;
+        if ( ngx_ssl_ticket_valid(t, cache->keystore[newi].keys.expire,
+             expiretime) == 0) {
+            if (ngx_ssl_ticket_new(cache,newi,expiretime) == NGX_OK) {
+                ngx_log_error(NGX_LOG_INFO, log, 0,
+                              "New ssl session ticket generated");
+            } else {
+                /* insufficent randomness */
+                ngx_log_error(NGX_LOG_WARN, log, 0,
+                    "RAND_bytes entropy empty on new key material");
+#if (NGX_THREADS)
+                ngx_shmtx_unlock(cache->keyrefresh);
+#endif
+                return -1;
+            }
+            cache->keystore_i = newi;
+            ngx_log_debug7(NGX_LOG_DEBUG_EVENT, log, 0,
+                   "New key/hmac for SSL session ticket key %d name %*Xs"
+                   "aes_key %*Xs hmac_key %*Xs",
+                   newi,
+                   (size_t)16, cache->keystore[newi].key_name,
+                   (size_t)16, cache->keystore[newi].keys.aes_key,
+                   (size_t)16, cache->keystore[newi].keys.hmac_key);
+        } else {
+            ngx_log_debug1(NGX_LOG_DEBUG_EVENT, log, 0, "Was tasked to SSL"
+                "session renew ticket %d but it wasn't expired. Assume another"
+                "thread/process fixed it for us", newi);
+        }
+#if (NGX_THREADS)
+        ngx_shmtx_unlock(cache->keyrefresh);
+#endif
+        break;
+    case 0:
+        /* primary key expired */
+        ngx_log_debug(NGX_LOG_DEBUG_EVENT, log, 0,
+              "SSL session ticket current key expired - generating");
+#if (NGX_THREADS)
+        ngx_shmtx_lock(cache->keyrefresh);
+#endif
+        /* race condition prevention inside mutex */
+        if ( ngx_ssl_ticket_valid(t, 
+            cache->keystore[cache->keystore_i].keys.expire, expiretime) == 0) {
+            if (ngx_ssl_ticket_new(cache,cache->keystore_i, expiretime)
+                == NGX_OK) {
+                ngx_log_error(NGX_LOG_INFO, log, 0,
+                              "New ssl session ticket generated");
+            } else {
+                /* insufficent randomness */
+                ngx_log_error(NGX_LOG_WARN, log, 0,
+                    "RAND_bytes entropy empty on new key material");
+#if (NGX_THREADS)
+                ngx_shmtx_unlock(&(cache->keyrefresh));
+#endif
+                return -1;
+            }
+        } else {
+            ngx_log_debug1(NGX_LOG_DEBUG_EVENT, log, 0,
+               "SSL session ticket was to renew current ticket %d but it wasn't"
+               " expired. Assume another thread/process fixed it for us"
+               , cache->keystore_i);
+        }
+        newi = cache->keystore_i;      
+#if (NGX_THREADS)
+        ngx_shmtx_unlock(&(cache->keyrefresh));
+#endif
+        ngx_log_debug7(NGX_LOG_DEBUG_EVENT, log, 0,
+            "New key/hmac for SSL session ticket key %d name %*Xs aes_key %*Xs"
+            " hmac_key %*Xs",
+            newi,
+            (size_t) 16, cache->keystore[newi].key_name,
+            (size_t) 16, cache->keystore[newi].keys.aes_key,
+            (size_t) 16, cache->keystore[newi].keys.hmac_key);
+    }
+    k = &cache->keystore[cache->keystore_i];
+    ngx_memcpy(key_name, k->key_name, 16);
+    
+    EVP_EncryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, k->keys.aes_key, iv);
+    HMAC_Init_ex(hctx, k->keys.hmac_key, 16, EVP_sha256(), NULL);
+    ngx_log_debug7(NGX_LOG_DEBUG_EVENT, log, 0,
+         "New SSL session ticket %d with name %*Xs aes_key %*Xs hmac_key %*Xs",
+         cache->keystore_i,
+         (size_t) 16, k->key_name,
+         (size_t) 16, k->keys.aes_key,
+         (size_t) 16, k->keys.hmac_key);
+    return 1;
+}
+
+/* tip copied off the Apache httpd source - assumed tlsext_tick_md didn't exist
+ * at some version of openssl */
+#ifndef tlsext_tick_md
+#ifdef OPENSSL_NO_SHA256
+#define tlsext_tick_md EVP_sha1
+#else
+#define tlsext_tick_md EVP_sha256
+#endif
+#endif
+
+static int
+ngx_ssl_tlsext_ticket_key_cb(ngx_ssl_conn_t *s, unsigned char *key_name,
+    unsigned char *iv, EVP_CIPHER_CTX *ctx, HMAC_CTX *hctx, int enc)
+{
+    SSL_CTX                  *ssl_ctx;
+    ngx_shm_zone_t           *shm_zone;
+    ngx_ssl_cache_t          *bigcache;
+    ngx_ssl_ticket_cache_t   *cache;
+    ngx_connection_t         *c;
+    ngx_log_t                *log;
+    time_t                   t;
+    ngx_ssl_ticket_keys_t    *keys;
+    unsigned                 a;
+    unsigned                 i;
+    int                      cmp;
+    int                      renew;
+    long                     expiretime;
+
+    ssl_ctx = SSL_get_SSL_CTX(s);
+    shm_zone = SSL_CTX_get_ex_data(ssl_ctx, ngx_ssl_session_cache_index);
+    expiretime = *((long *) SSL_CTX_get_ex_data(ssl_ctx, ngx_ssl_ticket_timeout_index));
+    bigcache = shm_zone->data;
+    cache = &bigcache->ticket;
+
+    c = ngx_ssl_get_connection(s);
+    log = c->log;
+    t = ngx_time();
+
+    ngx_log_debug5(NGX_LOG_DEBUG_EVENT, log, 0,
+                   "tlsext_ticket_key_cb (in): key_name: %*Xs iv: %*Xs enc %d",
+                    (size_t) 16, key_name,
+                    (size_t) EVP_MAX_IV_LENGTH, iv,
+                    enc);
+    if (enc) {
+        return ngx_ssl_tlsext_ticket_key_create(cache, log, key_name, iv, ctx,
+            hctx,expiretime);
+    } else {
+        /* retrieve session */
+        a = 0;
+        cmp = -1;
+        for (i = a = cache->keystore_i;
+                i < NGX_SSL_ACTIVE_TICKETS &&
+                (cmp = ngx_memcmp(key_name, cache->keystore[a].key_name,16)!=0);
+             ++i, a = (a + 1) % NGX_SSL_ACTIVE_TICKETS);
+        if (cmp == 0) {
+            keys = &cache->keystore[a].keys;
+        } else {
+            ngx_log_debug2(NGX_LOG_DEBUG_EVENT, log, 0, "SSL session ticket key "
+                "%*Xs not found", (size_t) 16, key_name);
+            return 0;
+        }
+        renew = ngx_ssl_ticket_valid(t, cache->keystore[a].keys.expire,
+            expiretime);
+        if (renew == 0) {
+            ngx_log_debug3(NGX_LOG_DEBUG_EVENT, log, 0, "retreiving key %d "
+                "expired %T < now %T", a, keys->expire, t);
+            return 0;
+        }
+
+        HMAC_Init_ex(hctx, keys->hmac_key, 16, tlsext_tick_md(), NULL);
+        EVP_DecryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, keys->aes_key, iv);
+        ngx_log_debug8(NGX_LOG_DEBUG_EVENT, log, 0,
+            "Resumed SSL session ticket %d with iv %*Xs aes_key %*Xs "
+            "hmac_key %*Xs renew %s",
+            a,
+            (size_t) 16, iv,
+            (size_t) 16, keys->aes_key,
+            (size_t) 16, keys->hmac_key,
+            ((renew == 2) ? "yes" : "no"));
+        if  (renew == 2) {
+            /* this sesssion will get a new ticket. This is handled in the ssl
+             * library and will call this function again with a enc=0 */
+            ngx_log_debug5(NGX_LOG_DEBUG_EVENT, log, 0,
+                           "tlsext_ticket_key_cb (out): key_name: %*Xs iv: %*Xs"
+                           " enc %d ret 2",
+                           (size_t) 16, key_name,
+                           (size_t) EVP_MAX_IV_LENGTH, iv,
+                           enc);
+            return 2;
+        }
+    }
+    ngx_log_debug5(NGX_LOG_DEBUG_EVENT, log, 0,
+                   "tlsext_ticket_key_cb (out): key_name: %*Xs iv: %*Xs enc %d - ret 1",
+                   (size_t) 16, key_name,
+                   (size_t) EVP_MAX_IV_LENGTH, iv,
+                   enc);
+    return 1;
+}
+
+
+
 
 
 /*
@@ -1646,6 +1975,11 @@ ngx_ssl_new_session(ngx_ssl_conn_t *ssl_conn, ngx_ssl_session_t *sess)
 
     len = i2d_SSL_SESSION(sess, NULL);
 
+
+    /* This isn't called if a session ticket is created
+     * see rfc5077 3.4
+     */
+
     /* do not cache too big session */
 
     if (len > (int) NGX_SSL_MAX_SESSION_SIZE) {
@@ -1660,7 +1994,7 @@ ngx_ssl_new_session(ngx_ssl_conn_t *ssl_conn, ngx_ssl_session_t *sess)
     ssl_ctx = SSL_get_SSL_CTX(ssl_conn);
     shm_zone = SSL_CTX_get_ex_data(ssl_ctx, ngx_ssl_session_cache_index);
 
-    cache = shm_zone->data;
+    cache = &((ngx_ssl_cache_t  *) shm_zone->data)->session;
     shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
 
     ngx_shmtx_lock(&shpool->mutex);
@@ -1781,7 +2115,7 @@ ngx_ssl_get_cached_session(ngx_ssl_conn_t *ssl_conn, u_char *id, int len,
     shm_zone = SSL_CTX_get_ex_data(SSL_get_SSL_CTX(ssl_conn),
                                    ngx_ssl_session_cache_index);
 
-    cache = shm_zone->data;
+    cache = &((ngx_ssl_cache_t  *) shm_zone->data)->session;
 
     sess = NULL;
 
@@ -1877,7 +2211,7 @@ ngx_ssl_remove_session(SSL_CTX *ssl, ngx_ssl_session_t *sess)
         return;
     }
 
-    cache = shm_zone->data;
+    cache = &((ngx_ssl_cache_t  *) shm_zone->data)->session;
 
     id = sess->session_id;
     len = (size_t) sess->session_id_length;

@@ -123,6 +123,13 @@ static ngx_command_t  ngx_mail_ssl_commands[] = {
       offsetof(ngx_mail_ssl_conf_t, session_timeout),
       NULL },
 
+    { ngx_string("ssl_ticket_session_timeout"),
+      NGX_MAIL_MAIN_CONF|NGX_MAIL_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_sec_slot,
+      NGX_MAIL_SRV_CONF_OFFSET,
+      offsetof(ngx_mail_ssl_conf_t, ticket_timeout),
+      NULL },
+
       ngx_null_command
 };
 
@@ -184,6 +191,7 @@ ngx_mail_ssl_create_conf(ngx_conf_t *cf)
     scf->prefer_server_ciphers = NGX_CONF_UNSET;
     scf->builtin_session_cache = NGX_CONF_UNSET;
     scf->session_timeout = NGX_CONF_UNSET;
+    scf->ticket_timeout = NGX_CONF_UNSET;
 
     return scf;
 }
@@ -204,6 +212,9 @@ ngx_mail_ssl_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_value(conf->session_timeout,
                          prev->session_timeout, 300);
+
+    ngx_conf_merge_value(conf->ticket_timeout,
+                         prev->ticket_timeout, 60*60*24*7); /* 1 week */
 
     ngx_conf_merge_value(conf->prefer_server_ciphers,
                          prev->prefer_server_ciphers, 0);
@@ -317,7 +328,8 @@ ngx_mail_ssl_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 
     if (ngx_ssl_session_cache(&conf->ssl, &ngx_mail_ssl_sess_id_ctx,
                               conf->builtin_session_cache,
-                              conf->shm_zone, conf->session_timeout)
+                              conf->shm_zone, conf->session_timeout,
+                              &conf->ticket_timeout)
         != NGX_OK)
     {
         return NGX_CONF_ERROR;
@@ -468,7 +480,7 @@ ngx_mail_ssl_session_cache(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 return NGX_CONF_ERROR;
             }
 
-            scf->shm_zone->init = ngx_ssl_session_cache_init;
+            scf->shm_zone->init = ngx_ssl_cache_init;
 
             continue;
         }
